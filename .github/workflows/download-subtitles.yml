@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       languages:
-        description: "Original subtitle languages, for example ru,en"
+        description: "Subtitle languages (comma-separated). Example: ru,en"
         required: false
         default: "ru,en"
         type: string
@@ -19,6 +19,7 @@ permissions:
 jobs:
   subtitles:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -29,99 +30,75 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
           python -m pip install --upgrade yt-dlp
+          yt-dlp --version
 
       - name: Download existing subtitles only
         env:
           PLAYLIST_URL: ${{ inputs.playlist_url }}
           LANGUAGES: ${{ inputs.languages }}
         run: |
+          set -e
           mkdir -p output
-          touch report.txt
 
+          echo "Playlist: $PLAYLIST_URL"
+          echo "Languages: $LANGUAGES"
+          echo ""
+
+          # One call for the whole playlist — fewer requests, less rate-limiting
+          # --sleep-requests helps avoid HTTP 429 from YouTube
           yt-dlp \
-            --flat-playlist \
-            --dump-single-json \
-            "$PLAYLIST_URL" > playlist.json
+            --skip-download \
+            --write-subs \
+            --write-auto-subs \
+            --sub-langs "$LANGUAGES" \
+            --sub-format "srt/vtt/best" \
+            --convert-subs srt \
+            --ignore-errors \
+            --sleep-requests 1 \
+            --sleep-interval 1 \
+            --max-sleep-interval 3 \
+            -o "output/%(playlist_index)03d - %(title)s.%(ext)s" \
+            "$PLAYLIST_URL" \
+            2>&1 | tee yt-dlp.log || true
 
-          python - <<'PY'
-          import json
-          import os
-          import subprocess
-          from pathlib import Path
+          echo ""
+          echo "=== Files in output/ ==="
+          find output -type f | sort || true
+          echo ""
 
-          playlist_url = os.environ["PLAYLIST_URL"]
-          languages = os.environ["LANGUAGES"]
-          output = Path("output")
-          report = Path("report.txt")
+          # Build report.txt
+          {
+            echo "Playlist: $PLAYLIST_URL"
+            echo "Languages: $LANGUAGES"
+            echo ""
+            if [ -d output ] && [ "$(find output -type f 2>/dev/null | wc -l)" -gt 0 ]; then
+              echo "Found subtitle files:"
+              find output -type f | sort | while read -r f; do
+                echo "  [FOUND] $f"
+              done
+            else
+              echo "No subtitle files were downloaded."
+              echo ""
+              echo "Possible reasons:"
+              echo "  - videos have no subtitles in the requested languages"
+              echo "  - YouTube rate-limited the runner (HTTP 429)"
+              echo "  - playlist URL is invalid or private"
+              echo ""
+              echo "Last lines of yt-dlp log:"
+              tail -40 yt-dlp.log || true
+            fi
+          } > report.txt
 
-          data = json.loads(Path("playlist.json").read_text())
-          entries = data.get("entries", [])
-
-          with report.open("w", encoding="utf-8") as log:
-              log.write(f"Playlist: {playlist_url}\n")
-              log.write(f"Languages: {languages}\n\n")
-
-              for index, entry in enumerate(entries, start=1):
-                  if not entry:
-                      continue
-
-                  video_id = entry.get("id")
-                  title = entry.get("title") or video_id
-                  video_url = f"https://www.youtube.com/watch?v={video_id}"
-
-                  safe_title = "".join(
-                      c if c.isalnum() or c in " ._-()" else "_"
-                      for c in title
-                  ).strip()
-
-                  prefix = f"{index:03d} - {safe_title}"
-
-                  before = set(output.glob(f"{prefix}*"))
-
-                  command = [
-                      "yt-dlp",
-                      "--skip-download",
-                      "--write-subs",
-                      "--write-auto-subs",
-                      "--sub-langs", languages,
-                      "--sub-format", "srt/vtt/best",
-                      "--convert-subs", "srt",
-                      "--ignore-errors",
-                      "--no-warnings",
-                      "-o", str(output / f"{prefix}.%(ext)s"),
-                      video_url,
-                  ]
-
-                  result = subprocess.run(
-                      command,
-                      text=True,
-                      capture_output=True
-                  )
-
-                  after = set(output.glob(f"{prefix}*"))
-                  new_files = sorted(after - before)
-
-                  if new_files:
-                      names = ", ".join(
-                          str(path.relative_to(output)) for path in new_files
-                      )
-                      log.write(f"[FOUND] {index:03d} {title}: {names}\n")
-                  else:
-                      log.write(f"[SKIPPED] {index:03d} {title}: no subtitles\n")
-
-                  if result.returncode != 0 and not new_files:
-                      log.write(
-                          f"[INFO] yt-dlp returned code {result.returncode}\n"
-                      )
-          PY
+          cat report.txt
 
       - name: Create ZIP archive
         run: |
           if [ -d output ] && [ "$(find output -type f | wc -l)" -gt 0 ]; then
-            zip -r subtitles.zip output report.txt
+            zip -r subtitles.zip output report.txt yt-dlp.log
+            echo "ZIP created with subtitle files."
           else
             echo "No subtitle files were found."
-            zip subtitles.zip report.txt
+            zip subtitles.zip report.txt yt-dlp.log
           fi
 
       - name: Upload subtitles artifact
