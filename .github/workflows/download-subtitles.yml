@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       languages:
-        description: "Subtitle languages (comma-separated). Example: ru,en"
+        description: "Preferred languages, comma-separated (tried in order). Example: ru,en"
         required: false
         default: "ru,en"
         type: string
@@ -19,17 +19,21 @@ permissions:
 jobs:
   subtitles:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-          python -m pip install --upgrade yt-dlp
+          python -m pip install --upgrade pip
+          python -m pip install -U yt-dlp youtube-transcript-api
           yt-dlp --version
 
       - name: Download existing subtitles only
@@ -37,68 +41,173 @@ jobs:
           PLAYLIST_URL: ${{ inputs.playlist_url }}
           LANGUAGES: ${{ inputs.languages }}
         run: |
-          set -e
           mkdir -p output
+          python << 'PY'
+          import os
+          import re
+          import time
+          import json
+          from pathlib import Path
 
-          echo "Playlist: $PLAYLIST_URL"
-          echo "Languages: $LANGUAGES"
-          echo ""
+          playlist_url = os.environ["PLAYLIST_URL"].strip()
+          languages = [x.strip() for x in os.environ["LANGUAGES"].split(",") if x.strip()]
+          output = Path("output")
+          report_path = Path("report.txt")
 
-          # One call for the whole playlist — fewer requests, less rate-limiting
-          # --sleep-requests helps avoid HTTP 429 from YouTube
-          yt-dlp \
-            --skip-download \
-            --write-subs \
-            --write-auto-subs \
-            --sub-langs "$LANGUAGES" \
-            --sub-format "srt/vtt/best" \
-            --convert-subs srt \
-            --ignore-errors \
-            --sleep-requests 1 \
-            --sleep-interval 1 \
-            --max-sleep-interval 3 \
-            -o "output/%(playlist_index)03d - %(title)s.%(ext)s" \
-            "$PLAYLIST_URL" \
-            2>&1 | tee yt-dlp.log || true
+          def safe_name(s: str) -> str:
+              s = re.sub(r"[^\w\s._()-]+", "_", s, flags=re.UNICODE)
+              return s.strip()[:120] or "video"
 
-          echo ""
-          echo "=== Files in output/ ==="
-          find output -type f | sort || true
-          echo ""
+          def to_srt(segments) -> str:
+              lines = []
+              for i, seg in enumerate(segments, 1):
+                  # youtube-transcript-api returns objects or dicts depending on version
+                  if hasattr(seg, "start"):
+                      start = float(seg.start)
+                      duration = float(getattr(seg, "duration", 0) or 0)
+                      text = str(seg.text).replace("\n", " ").strip()
+                  else:
+                      start = float(seg.get("start", 0))
+                      duration = float(seg.get("duration", 0) or 0)
+                      text = str(seg.get("text", "")).replace("\n", " ").strip()
+                  end = start + duration
 
-          # Build report.txt
-          {
-            echo "Playlist: $PLAYLIST_URL"
-            echo "Languages: $LANGUAGES"
-            echo ""
-            if [ -d output ] && [ "$(find output -type f 2>/dev/null | wc -l)" -gt 0 ]; then
-              echo "Found subtitle files:"
-              find output -type f | sort | while read -r f; do
-                echo "  [FOUND] $f"
-              done
-            else
-              echo "No subtitle files were downloaded."
-              echo ""
-              echo "Possible reasons:"
-              echo "  - videos have no subtitles in the requested languages"
-              echo "  - YouTube rate-limited the runner (HTTP 429)"
-              echo "  - playlist URL is invalid or private"
-              echo ""
-              echo "Last lines of yt-dlp log:"
-              tail -40 yt-dlp.log || true
-            fi
-          } > report.txt
+                  def ts(sec: float) -> str:
+                      h = int(sec // 3600)
+                      m = int((sec % 3600) // 60)
+                      s = int(sec % 60)
+                      ms = int(round((sec - int(sec)) * 1000))
+                      return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-          cat report.txt
+                  lines.append(f"{i}")
+                  lines.append(f"{ts(start)} --> {ts(end)}")
+                  lines.append(text)
+                  lines.append("")
+              return "\n".join(lines)
+
+          # 1) Get playlist video IDs via yt-dlp (flat, no download)
+          import subprocess
+          proc = subprocess.run(
+              ["yt-dlp", "--flat-playlist", "--dump-single-json", playlist_url],
+              capture_output=True,
+              text=True,
+          )
+          if proc.returncode != 0:
+              report_path.write_text(
+                  f"Failed to read playlist.\n\nstdout:\n{proc.stdout}\n\nstderr:\n{proc.stderr}\n",
+                  encoding="utf-8",
+              )
+              print(report_path.read_text())
+              raise SystemExit(0)
+
+          data = json.loads(proc.stdout)
+          entries = [e for e in (data.get("entries") or []) if e]
+
+          from youtube_transcript_api import YouTubeTranscriptApi
+          from youtube_transcript_api._errors import (
+              TranscriptsDisabled,
+              NoTranscriptFound,
+              VideoUnavailable,
+          )
+
+          api = YouTubeTranscriptApi()
+          found = 0
+          skipped = 0
+          lines = [
+              f"Playlist: {playlist_url}",
+              f"Languages (priority): {', '.join(languages)}",
+              f"Videos in playlist: {len(entries)}",
+              "",
+          ]
+
+          for index, entry in enumerate(entries, start=1):
+              video_id = entry.get("id") or ""
+              title = entry.get("title") or video_id
+              prefix = f"{index:03d} - {safe_name(title)}"
+
+              if not video_id:
+                  lines.append(f"[SKIPPED] {index:03d} (no id)")
+                  skipped += 1
+                  continue
+
+              try:
+                  # Prefer requested languages, then any available
+                  transcript = None
+                  used_lang = None
+                  try:
+                      transcript = api.fetch(video_id, languages=languages)
+                      used_lang = languages[0] if languages else "unknown"
+                      # Try to detect actual language from fetched transcript if possible
+                      if hasattr(transcript, "language_code"):
+                          used_lang = transcript.language_code
+                  except Exception:
+                      # Fallback: list and pick best match
+                      try:
+                          tlist = api.list(video_id)
+                          chosen = None
+                          for lang in languages:
+                              try:
+                                  chosen = tlist.find_transcript([lang])
+                                  break
+                              except Exception:
+                                  pass
+                          if chosen is None:
+                              # any generated or manual
+                              try:
+                                  chosen = tlist.find_generated_transcript(languages or ["en", "ru"])
+                              except Exception:
+                                  try:
+                                      chosen = next(iter(tlist))
+                                  except Exception:
+                                      chosen = None
+                          if chosen is None:
+                              raise NoTranscriptFound(video_id, languages, tlist)
+                          transcript = chosen.fetch()
+                          used_lang = getattr(chosen, "language_code", "unk")
+                      except Exception as e2:
+                          raise e2
+
+                  # Normalize to list of segments
+                  segments = list(transcript) if transcript is not None else []
+                  if not segments:
+                      lines.append(f"[SKIPPED] {index:03d} {title}: empty transcript")
+                      skipped += 1
+                      continue
+
+                  srt = to_srt(segments)
+                  out_file = output / f"{prefix}.{used_lang}.srt"
+                  out_file.write_text(srt, encoding="utf-8")
+                  lines.append(f"[FOUND] {index:03d} {title}: {out_file.name} ({len(segments)} cues)")
+                  found += 1
+                  print(f"OK {index}/{len(entries)} {title} -> {out_file.name}")
+
+              except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
+                  lines.append(f"[SKIPPED] {index:03d} {title}: {type(e).__name__}")
+                  skipped += 1
+                  print(f"SKIP {index}/{len(entries)} {title}: {type(e).__name__}")
+              except Exception as e:
+                  lines.append(f"[SKIPPED] {index:03d} {title}: {type(e).__name__}: {e}")
+                  skipped += 1
+                  print(f"ERR {index}/{len(entries)} {title}: {e}")
+
+              # Soft rate limit
+              time.sleep(0.7)
+
+          lines.append("")
+          lines.append(f"Total found: {found}")
+          lines.append(f"Total skipped: {skipped}")
+          report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          print("\n" + report_path.read_text())
+          PY
 
       - name: Create ZIP archive
         run: |
           if [ -d output ] && [ "$(find output -type f | wc -l)" -gt 0 ]; then
-            zip -r subtitles.zip output report.txt yt-dlp.log
+            zip -r subtitles.zip output report.txt
             echo "ZIP created with subtitle files."
           else
             echo "No subtitle files were found."
-            zip subtitles.zip report.txt yt-dlp.log
+            zip subtitles.zip report.txt
           fi
 
       - name: Upload subtitles artifact
